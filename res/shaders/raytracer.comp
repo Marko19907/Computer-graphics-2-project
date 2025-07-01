@@ -1,0 +1,316 @@
+#version 430 core
+
+// Work group size
+layout (local_size_x = 16, local_size_y = 16) in;
+
+// ------------------------------------
+//  1) Triangle + Material Structures
+// ------------------------------------
+struct Triangle {
+    // Each vec3 plus a float pad => 16 bytes
+    vec3 vertex0; float pad0;
+    vec3 vertex1; float pad1;
+    vec3 vertex2; float pad2;
+    
+    vec3 normal0; float pad3;
+    vec3 normal1; float pad4;
+    vec3 normal2; float pad5;
+    
+    // materialID is 4 bytes, but to keep the total a multiple of 16
+    // we add three float pads => total of 16 bytes for this last row
+    uint materialID; float pad6; float pad7; float pad8;
+};
+
+struct Material {
+    vec3 baseColor;   // diffuse color, 12 bytes, but aligned to 16
+    float pad0;       // pad to complete 16 bytes
+
+    // Two floats for material properties
+    float roughness;      // 4 bytes
+    float reflectivity;   // 4 bytes
+    // Add additional padding to reach a multiple of 16 bytes.
+    float pad1;           // 4 bytes
+    float pad2;           // 4 bytes
+};
+
+// ------------------------------------
+//  2) SSBOs
+// ------------------------------------
+layout(std430, binding = 1) buffer Triangles {
+    Triangle triangleData[]; // all the triangles
+};
+uniform int numTriangles;
+
+layout(std430, binding = 2) buffer Materials {
+    Material materials[]; // all the materials
+};
+
+// ------------------------------------
+//  3) Lights
+// ------------------------------------
+#define MAX_LIGHTS 64
+struct LightSource {
+    vec3 position;
+    vec3 color;
+};
+
+uniform int numLights;
+uniform LightSource lights[MAX_LIGHTS];
+
+// An ambient color
+uniform vec3 ambientColor;
+
+// Distance attenuation constants
+const float ATT_CONST  = 0.0011;
+const float ATT_LINEAR = 0.0014;
+const float ATT_QUAD   = 0.0038;
+
+// ------------------------------------
+//  4) Ray tracing uniforms
+// ------------------------------------
+uniform mat4 invProjection;
+uniform mat4 invView;
+uniform vec3 cameraPosition;
+
+// ------------------------------------
+//  5) Intersection Routines
+// ------------------------------------
+
+// Intersect a ray with a triangle using barycentrics
+// Returns true if an intersection occurs and outputs (intersectionDistance, barycentricU, barycentricV)
+bool intersectTriangleBary(
+    vec3 rayOrigin, vec3 rayDirection,
+    vec3 triangleVertex0, vec3 triangleVertex1, vec3 triangleVertex2,
+    out float intersectionDistance, out float barycentricU, out float barycentricV
+) {
+    vec3 edge0 = triangleVertex1 - triangleVertex0;
+    vec3 edge1 = triangleVertex2 - triangleVertex0;
+    vec3 perpVector = cross(rayDirection, edge1);
+    float determinant = dot(edge0, perpVector);
+    
+    // If determinant is near zero, the ray is parallel or too close
+    if (abs(determinant) < 1e-6) return false;
+    float inverseDeterminant = 1.0 / determinant;
+
+    vec3 vertexToOrigin = rayOrigin - triangleVertex0;
+    barycentricU = dot(vertexToOrigin, perpVector) * inverseDeterminant;
+    if (barycentricU < 0.0 || barycentricU > 1.0) return false;
+
+    vec3 qVector = cross(vertexToOrigin, edge0);
+    barycentricV = dot(rayDirection, qVector) * inverseDeterminant;
+    if (barycentricV < 0.0 || barycentricU + barycentricV > 1.0) return false;
+
+    intersectionDistance = dot(edge1, qVector) * inverseDeterminant;
+    return (intersectionDistance > 0.0001);
+}
+
+// Returns the index of the closest triangle hit (or -1 if none)
+// Also returns the intersectionDistance, barycentricU, and barycentricV for that hit
+int findClosestTriangle(
+    vec3 rayOrigin, vec3 rayDirection,
+    out float closestIntersectionDistance, out float bestBarycentricU, out float bestBarycentricV
+) {
+    float minIntersectionDistance = 1e30;
+    int closestTriangleIndex = -1;
+    float barycentricU_Best = 0.0;
+    float barycentricV_Best = 0.0;
+
+    for (int triangleIndex = 0; triangleIndex < numTriangles; triangleIndex++) {
+        float intersectionDistance, barycentricU, barycentricV;
+        if (intersectTriangleBary(rayOrigin, rayDirection, 
+                                  triangleData[triangleIndex].vertex0, 
+                                  triangleData[triangleIndex].vertex1, 
+                                  triangleData[triangleIndex].vertex2,
+                                  intersectionDistance, barycentricU, barycentricV)) 
+        {
+            // Interpolate normal from the triangle vertices
+            vec3 normal0 = triangleData[triangleIndex].normal0;
+            vec3 normal1 = triangleData[triangleIndex].normal1;
+            vec3 normal2 = triangleData[triangleIndex].normal2;
+            vec3 interpolatedNormal = normalize(normal0 * (1.0 - barycentricU - barycentricV) + normal1 * barycentricU + normal2 * barycentricV);
+            
+            // Backface culling: skip if the ray is hitting the back side
+            if (dot(rayDirection, interpolatedNormal) > 0.0) {
+                continue; 
+            }
+
+            if (intersectionDistance < minIntersectionDistance && intersectionDistance > 0.0001) {
+                minIntersectionDistance = intersectionDistance;
+                closestTriangleIndex = triangleIndex;
+                barycentricU_Best = barycentricU;
+                barycentricV_Best = barycentricV;
+            }
+        }
+    }
+
+    closestIntersectionDistance = minIntersectionDistance;
+    bestBarycentricU = barycentricU_Best;
+    bestBarycentricV = barycentricV_Best;
+    return closestTriangleIndex;
+}
+
+// For shadows: check if there is any occluder between an intersection point and a light source
+bool inShadowForLight(vec3 intersectionPoint, vec3 surfaceNormal, vec3 lightPosition)
+{
+    vec3 shadowRayOrigin = intersectionPoint + surfaceNormal * 0.001; // offset to avoid self-intersection
+    vec3 directionToLight = lightPosition - shadowRayOrigin;
+    float distanceToLight = length(directionToLight);
+    vec3 normalizedLightDirection = normalize(directionToLight);
+
+    float unusedBarycentricU, unusedBarycentricV, intersectionDistance;
+    int hitTriangleIndex = findClosestTriangle(shadowRayOrigin, normalizedLightDirection, intersectionDistance, unusedBarycentricU, unusedBarycentricV);
+    if (hitTriangleIndex < 0) {
+        // No intersection: not in shadow
+        return false;
+    }
+    // If the intersection is closer than the light distance, the point is in shadow
+    return (intersectionDistance < distanceToLight);
+}
+
+// ------------------------------------
+//  6) Shading
+// ------------------------------------
+
+// Computes local Phong-ish shading at the intersection point
+vec3 computeLocalShading(
+    vec3 intersectionPoint,
+    vec3 surfaceNormal,
+    vec3 viewDirection,
+    Material material
+) {
+    // Start with ambient lighting tinted by the base color
+    vec3 shadedColor = ambientColor * material.baseColor;
+
+    // For each light, compute diffuse and specular contributions with distance attenuation
+    for (int lightIndex = 0; lightIndex < numLights; lightIndex++) {
+        vec3 lightDirection = normalize(lights[lightIndex].position - intersectionPoint);
+        float distance = length(lights[lightIndex].position - intersectionPoint);
+        float attenuation = 1.0 / (ATT_CONST + ATT_LINEAR * distance + ATT_QUAD * distance * distance);
+
+        // Determine shadows
+        bool isShadowed = inShadowForLight(intersectionPoint, surfaceNormal, lights[lightIndex].position);
+        float shadowFactor = (isShadowed ? 0.1 : 1.0);
+
+        // Diffuse term
+        float diffuseTerm = max(dot(surfaceNormal, lightDirection), 0.0);
+
+        // Specular term (Blinn-Phong)
+        vec3 halfwayVector = normalize(lightDirection + viewDirection);
+        float specularFactor = max(dot(surfaceNormal, halfwayVector), 0.0);
+        float specularExponent = 16.0 / (0.001 + material.roughness);  
+        float specularTerm = pow(specularFactor, specularExponent);
+
+        // Combine contributions
+        vec3 lightColor = lights[lightIndex].color;
+        vec3 lightContribution = attenuation * shadowFactor * (material.baseColor * diffuseTerm + specularTerm * vec3(1.0));
+        shadedColor += lightColor * lightContribution;
+    }
+    return shadedColor;
+}
+
+// ------------------------------------
+//  7) Raytrace with multiple bounces
+// ------------------------------------
+
+#define MAX_BOUNCES 3
+// The background color when no intersection is found
+const vec3 BACKGROUND = vec3(0.0);
+
+vec3 traceRay(vec3 rayOrigin, vec3 rayDirection)
+{
+    vec3 finalColor = vec3(0.0);   // Final accumulated color
+    vec3 throughput = vec3(1.0);   // Contribution weight of the current ray
+
+    for (int bounceCount = 0; bounceCount < MAX_BOUNCES; bounceCount++) {
+        float hitDistance, barycentricU, barycentricV;
+        int triangleIndex = findClosestTriangle(rayOrigin, rayDirection, hitDistance, barycentricU, barycentricV);
+
+        if (triangleIndex < 0) {
+            // No intersection: add background color
+            finalColor += throughput * BACKGROUND;
+            break;
+        }
+
+        // Get the intersected triangle and compute the interpolated normal
+        Triangle hitTriangle = triangleData[triangleIndex];
+        vec3 normal0 = hitTriangle.normal0;
+        vec3 normal1 = hitTriangle.normal1;
+        vec3 normal2 = hitTriangle.normal2;
+        float barycentricW = 1.0 - barycentricU - barycentricV;
+        vec3 interpolatedNormal = normalize(normal0 * barycentricW + normal1 * barycentricU + normal2 * barycentricV);
+
+        // Compute intersection point
+        vec3 intersectionPoint = rayOrigin + rayDirection * hitDistance;
+
+        // Look up the material
+        uint materialID = hitTriangle.materialID;
+        Material material = materials[materialID];
+
+        // Compute local shading
+        vec3 viewDirection = normalize(cameraPosition - intersectionPoint);
+        vec3 localShadedColor = computeLocalShading(intersectionPoint, interpolatedNormal, viewDirection, material);
+
+        // Combine the local shading with the current throughput
+        float reflectivity = material.reflectivity;
+        float diffuseWeight = 1.0 - reflectivity;
+        finalColor += throughput * localShadedColor * diffuseWeight;
+
+        // If the material is not reflective, end tracing
+        if (reflectivity < 0.001) {
+            break;
+        }
+
+        // Update throughput for reflection
+        throughput *= reflectivity;
+
+        // Update ray for the next bounce: reflect direction around the normal
+        vec3 reflectionDirection = reflect(rayDirection, interpolatedNormal);
+
+        // Offset the origin to avoid self-intersections
+        rayOrigin = intersectionPoint + interpolatedNormal * 0.001;
+        rayDirection = reflectionDirection;
+    }
+
+    return finalColor;
+}
+
+// ------------------------------------
+//  8) Main Compute Shader Entry Point
+// ------------------------------------
+layout(rgba32f, binding = 0) uniform image2D outputImage;
+
+void main() 
+{
+    ivec2 pixelCoordinates = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageDimensions = imageSize(outputImage);
+
+    // If out of bounds, exit early
+    if (pixelCoordinates.x >= imageDimensions.x || pixelCoordinates.y >= imageDimensions.y) {
+        return;
+    }
+
+    // Convert pixel coordinates to normalized device coordinates (NDC) in [-1,1]
+    vec2 uv = (vec2(pixelCoordinates) / vec2(imageDimensions)) * 2.0 - 1.0;
+
+    // Undo the projection transform
+    vec4 projectionSpaceTarget = invProjection * vec4(uv, 1.0, 1.0);
+    projectionSpaceTarget /= projectionSpaceTarget.w;
+
+    // Undo the view transform to get a world-space target
+    vec4 worldSpaceTarget = invView * projectionSpaceTarget;
+    vec3 rayDirection = normalize(worldSpaceTarget.xyz - cameraPosition);
+
+    // Perform ray tracing with multiple bounces
+    vec3 finalColor = traceRay(cameraPosition, rayDirection);
+
+    imageStore(outputImage, pixelCoordinates, vec4(finalColor, 1.0));
+}
+
+
+
+// Alternative main function for testing, just outputs red pixels
+void main2() {
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+    imageStore(outputImage, pixelCoords, vec4(1.0, 0.0, 0.0, 1.0));
+}
+
